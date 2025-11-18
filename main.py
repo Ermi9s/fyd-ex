@@ -1,14 +1,17 @@
+import base64
+import os
+import re
+from datetime import datetime
+
 import fitz
 from PIL import Image
 from pyzbar.pyzbar import decode
-import pytesseract
-import re
-import base64
-import os
-import cv2
-import numpy as np
-from datetime import date
+
+import easyocr
 from rembg import remove
+
+
+_EASYOCR_READER = None
 
 
 def encode_image_to_base64(image_path):
@@ -21,47 +24,59 @@ def encode_image_to_base64(image_path):
     encoded = base64.b64encode(data).decode('utf-8')
     return f"data:{mime};base64,{encoded}"
 
-pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
 
-month_dict = {
-    'Jan': '01', 'Feb': '02', 'Mar': '03', 'Apr': '04', 'May': '05', 'Jun': '06',
-    'Jul': '07', 'Aug': '08', 'Sep': '09', 'Oct': '10', 'Nov': '11', 'Dec': '12'
-}
+def get_easyocr_reader():
+    global _EASYOCR_READER
+    if _EASYOCR_READER is None:
+        languages = ["en"]
+        if "AMHARIC" in os.environ.get("SUPPORTED_LANGS", "AMHARIC").upper():
+            languages.append("am")
+        _EASYOCR_READER = easyocr.Reader(languages, gpu=False, verbose=False)
+    return _EASYOCR_READER
 
-def gregorian_to_ethiopian(g_date_str):
-    if not g_date_str:
-        return None
-    parts = g_date_str.split('/')
-    if len(parts) != 3:
-        return None
-    try:
-        g_year = int(parts[0])
-        g_month = int(parts[1])
-        g_day = int(parts[2])
-    except ValueError:
-        return None
-    g_date = date(g_year, g_month, g_day)
-    is_leap_g = (g_year % 4 == 0 and (g_year % 100 != 0 or g_year % 400 == 0))
-    new_year_day = 11 if not is_leap_g else 12
-    new_year_g = date(g_year, 9, new_year_day)
-    if g_date < new_year_g:
-        et_year = g_year - 8
-        days_diff = (new_year_g - g_date).days
-        is_leap_et = (et_year % 4 == 0 and (et_year % 100 != 0 or et_year % 400 == 0))
-        total_days = 366 if is_leap_et else 365
-        et_day_of_year = total_days - days_diff
-    else:
-        et_year = g_year - 7
-        days_diff = (g_date - new_year_g).days
-        et_day_of_year = days_diff + 1
-    is_leap_et = (et_year % 4 == 0 and (et_year % 100 != 0 or et_year % 400 == 0))
-    if et_day_of_year <= 360:
-        et_month = (et_day_of_year - 1) // 30 + 1
-        et_day = (et_day_of_year - 1) % 30 + 1
-    else:
-        et_month = 13
-        et_day = et_day_of_year - 360
-    return f"{et_year:04d}/{et_month:02d}/{et_day:02d}"
+
+DATE_TOKEN_PATTERN = re.compile(r"\d{4}/(?:\d{2}|[A-Za-z]{3,9})/\d{2}")
+
+
+def normalize_date_token(token):
+    cleaned = token.strip().replace('.', '')
+    for fmt in ("%Y/%m/%d", "%Y/%b/%d", "%Y/%B/%d"):
+        try:
+            return datetime.strptime(cleaned, fmt).strftime("%Y/%m/%d")
+        except ValueError:
+            continue
+    return cleaned
+
+
+def extract_dates_from_text(text):
+    return [normalize_date_token(match) for match in DATE_TOKEN_PATTERN.findall(text)]
+
+
+def extract_dates_near_keyword(text, keyword, window=120):
+    idx = text.lower().find(keyword.lower())
+    if idx == -1:
+        return []
+    snippet = text[idx: idx + window]
+    return extract_dates_from_text(snippet)
+
+
+def extract_fin(text):
+    match = re.search(r"FIN[:\-\s]*([A-Z0-9]+)", text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def run_image_ocr(image_paths):
+    ocr_map = {path: "" for path in image_paths}
+    reader = get_easyocr_reader()
+    for path in image_paths:
+        try:
+            results = reader.readtext(path, detail=1, paragraph=False)
+            ocr_map[path] = " ".join(result[1] for result in results)
+        except Exception:
+            ocr_map[path] = ""
+    return ocr_map
 
 
 def process_face_image(image_path):
@@ -108,33 +123,6 @@ def decode_qr(path):
     except Exception:
         pass
     return None
-
-def parse_qr_data(qr_string):
-    if not qr_string:
-        return {}
-    dlt_index = qr_string.find("DLT:")
-    if dlt_index == -1:
-        return {"raw_qr": qr_string}
-
-    qr_blob = qr_string[:dlt_index]
-    structured_part = qr_string[dlt_index:]
-    parts = structured_part.split(":")
-    
-    if len(parts) < 10:
-        return {"qr_blob": qr_blob, "structured_part": structured_part}
-
-    return {
-        "qr_blob": qr_blob,
-        "type": parts[0],
-        "full_name": parts[1],
-        "version": parts[2],
-        "other_flags": parts[3:7],
-        "fcn": parts[7],
-        "dob": parts[9] if parts[8] == "D" else None,
-        "signature": ":".join(parts[11:]) if len(parts) > 11 and parts[10] == "SIGN" else None
-    }
-
-
 
 def extract_text_data(pdf_path):
     doc = fitz.open(pdf_path)
@@ -188,13 +176,7 @@ def parse_id_card(pdf_path):
     text_data = extract_text_data(pdf_path)
 
 
-    ocr_data = {}
-    for img_path in image_paths:
-        try:
-            text = pytesseract.image_to_string(Image.open(img_path))
-            ocr_data[img_path] = text
-        except Exception as e:
-            ocr_data[img_path] = ""
+    ocr_data = run_image_ocr(image_paths)
 
     fin = None
     date_of_issue_ec = None
@@ -202,56 +184,20 @@ def parse_id_card(pdf_path):
     expire_date_ec = None
     expire_date_gc = None
     for text in ocr_data.values():
-        if fin is None and "FIN" in text:
-            lines = text.split('\n')
-            for line in lines:
-                if "FIN" in line:
-                    fin_part = line.split('FIN', 1)[1].strip()
-                    fin = fin_part
-        if (date_of_issue_ec is None or date_of_issue_gc is None) and "Date of Issue" in text:
-            lines = text.split('\n')
-            for line in lines:
-                if "Date of Issue" in line:
-                    dates = re.findall(r'\d{4}/(?:\d{2}|\w{3})/\d{2}', line)
-                    processed_dates = []
-                    for date in dates:
-                        parts = date.split('/')
-                        if len(parts) == 3:
-                            year, month, day = parts
-                            if month.isalpha():
-                                month = month_dict.get(month, month)
-                            processed_date = f"{year}/{month}/{day}"
-                            processed_dates.append(processed_date)
-                    if len(processed_dates) >= 2:
-                        date_of_issue_ec = processed_dates[0]
-                        date_of_issue_gc = processed_dates[1]
-                    elif len(processed_dates) == 1:
-                        date_of_issue_ec = processed_dates[0]
-        if expire_date_ec is None or expire_date_gc is None and "Date of Expiry" in text:
-                lines = text.split('\n')
-                for i, line in enumerate(lines):
-                    if "Date of Expiry" in line:
-                        lines_to_check = lines[i:i+3]  
-                        
-                        dates = []
-                        for check_line in lines_to_check:
-                            dates.extend(re.findall(r'\d{4}/(?:\d{2}|\w{3})/\d{2}', check_line))
-                 
-                        processed_dates = []
-                        for date in dates:
-                            parts = date.split('/')
-                            if len(parts) == 3:
-                                year, month, day = parts
-                                if month.isalpha():
-                                    month = month_dict.get(month, month)
-                                processed_date = f"{year}/{month}/{day}"
-                                processed_dates.append(processed_date)
-                                
-                        if len(processed_dates) >= 2:
-                            expire_date_ec = processed_dates[0]
-                            expire_date_gc = processed_dates[1]
-                        elif len(processed_dates) == 1:
-                            expire_date_gc = processed_dates[0]
+        if fin is None:
+            fin = extract_fin(text)
+        if date_of_issue_ec is None or date_of_issue_gc is None:
+            issue_dates = extract_dates_near_keyword(text, "Date of Issue")
+            if issue_dates:
+                date_of_issue_ec = issue_dates[0]
+                if len(issue_dates) > 1:
+                    date_of_issue_gc = issue_dates[1]
+        if expire_date_ec is None or expire_date_gc is None:
+            expiry_dates = extract_dates_near_keyword(text, "Date of Expiry")
+            if expiry_dates:
+                expire_date_ec = expiry_dates[0]
+                if len(expiry_dates) > 1:
+                    expire_date_gc = expiry_dates[1]
     
 
     text_data["fin"] = fin
@@ -259,11 +205,6 @@ def parse_id_card(pdf_path):
     text_data["date_of_issue_gc"] = date_of_issue_gc
     text_data["expire_date_ec"] = expire_date_ec
     text_data["expire_date_gc"] = expire_date_gc
-
-    if text_data["date_of_issue_gc"] and not text_data["date_of_issue_ec"]:
-        text_data["date_of_issue_ec"] = gregorian_to_ethiopian(text_data["date_of_issue_gc"])
-    if text_data["expire_date_gc"] and not text_data["expire_date_ec"]:
-        text_data["expire_date_ec"] = gregorian_to_ethiopian(text_data["expire_date_gc"])
 
     # Process face image to remove background
     face_path = process_face_image(face_path)

@@ -3,9 +3,9 @@ import os
 import re
 from datetime import datetime
 
+import cv2
 import fitz
 from PIL import Image
-from pyzbar.pyzbar import decode
 
 import easyocr
 from rembg import remove
@@ -115,14 +115,17 @@ def extract_all_images(pdf_path):
 
 
 def decode_qr(path):
+    if not path or not os.path.exists(path):
+        return None
     try:
-        img = Image.open(path)
-        decoded_objs = decode(img)
-        if decoded_objs:
-            return decoded_objs[0].data.decode()
+        image = cv2.imread(path)
+        if image is None:
+            return None
+        detector = cv2.QRCodeDetector()
+        data, _, _ = detector.detectAndDecode(image)
+        return data or None
     except Exception:
-        pass
-    return None
+        return None
 
 def extract_text_data(pdf_path):
     doc = fitz.open(pdf_path)

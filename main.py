@@ -206,7 +206,6 @@ def parse_id_card(pdf_path):
     text_data["expire_date_ec"] = expire_date_ec
     text_data["expire_date_gc"] = expire_date_gc
 
-    # Process face image to remove background
     face_path = process_face_image(face_path)
     
     face_photo_b64 = encode_image_to_base64(face_path)

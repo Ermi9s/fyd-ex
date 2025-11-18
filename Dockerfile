@@ -6,6 +6,7 @@ ENV PIP_NO_CACHE_DIR=1 \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libzbar0 \
+    libzbar-dev \
     libgl1 \
     libglib2.0-0 \
     libsm6 \
